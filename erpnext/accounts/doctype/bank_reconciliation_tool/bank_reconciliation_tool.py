@@ -79,10 +79,17 @@ def get_bank_transactions(bank_account, from_date=None, to_date=None):
 
 
 @frappe.whitelist()
-def get_account_balance(bank_account, till_date):
+def get_account_balance(bank_account, till_date, company):
 	# returns account balance till the specified date
 	account = frappe.db.get_value("Bank Account", bank_account, "account")
-	filters = frappe._dict({"account": account, "report_date": till_date, "include_pos_transactions": 1})
+	filters = frappe._dict(
+		{
+			"account": account,
+			"report_date": till_date,
+			"include_pos_transactions": 1,
+			"company": company,
+		}
+	)
 	data = get_entries(filters)
 
 	balance_as_per_system = get_balance_on(filters["account"], filters["report_date"])
@@ -94,11 +101,7 @@ def get_account_balance(bank_account, till_date):
 
 	amounts_not_reflected_in_system = get_amounts_not_reflected_in_system(filters)
 
-	bank_bal = (
-		flt(balance_as_per_system) - flt(total_debit) + flt(total_credit) + amounts_not_reflected_in_system
-	)
-
-	return bank_bal
+	return flt(balance_as_per_system) - flt(total_debit) + flt(total_credit) + amounts_not_reflected_in_system
 
 
 @frappe.whitelist()
@@ -799,7 +802,6 @@ def get_je_matching_query(
 		.where(je.clearance_date.isnull())
 		.where(jea.account == common_filters.bank_account)
 		.where(amount_equality if exact_match else getattr(jea, amount_field) > 0.0)
-		.where(je.docstatus == 1)
 		.where(filter_by_date)
 		.orderby(je.cheque_date if cint(filter_by_reference_date) else je.posting_date)
 	)

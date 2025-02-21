@@ -25,6 +25,10 @@ from erpnext.accounts.doctype.invoice_discounting.invoice_discounting import (
 	get_party_account_based_on_invoice_discounting,
 )
 from erpnext.accounts.doctype.journal_entry.journal_entry import get_default_bank_cash_account
+from erpnext.accounts.doctype.repost_accounting_ledger.repost_accounting_ledger import (
+	validate_docs_for_deferred_accounting,
+	validate_docs_for_voucher_types,
+)
 from erpnext.accounts.doctype.tax_withholding_category.tax_withholding_category import (
 	get_party_tax_withholding_details,
 )
@@ -71,12 +75,16 @@ class PaymentEntry(AccountsController):
 			PaymentEntryReference,
 		)
 
+		advance_reconciliation_takes_effect_on: DF.Literal[
+			"Advance Payment Date", "Oldest Of Invoice Or Advance", "Reconciliation Date"
+		]
 		amended_from: DF.Link | None
 		apply_tax_withholding_amount: DF.Check
 		auto_repeat: DF.Link | None
 		bank: DF.ReadOnly | None
 		bank_account: DF.Link | None
 		bank_account_no: DF.ReadOnly | None
+		base_in_words: DF.SmallText | None
 		base_paid_amount: DF.Currency
 		base_paid_amount_after_tax: DF.Currency
 		base_received_amount: DF.Currency
@@ -92,21 +100,20 @@ class PaymentEntry(AccountsController):
 		custom_remarks: DF.Check
 		deductions: DF.Table[PaymentEntryDeduction]
 		difference_amount: DF.Currency
+		in_words: DF.SmallText | None
+		is_opening: DF.Literal["No", "Yes"]
 		letter_head: DF.Link | None
 		mode_of_payment: DF.Link | None
 		naming_series: DF.Literal["ACC-PAY-.YYYY.-"]
 		paid_amount: DF.Currency
 		paid_amount_after_tax: DF.Currency
 		paid_from: DF.Link
-		paid_from_account_balance: DF.Currency
 		paid_from_account_currency: DF.Link
 		paid_from_account_type: DF.Data | None
 		paid_to: DF.Link
-		paid_to_account_balance: DF.Currency
 		paid_to_account_currency: DF.Link
 		paid_to_account_type: DF.Data | None
 		party: DF.DynamicLink | None
-		party_balance: DF.Currency
 		party_bank_account: DF.Link | None
 		party_name: DF.Data | None
 		party_type: DF.Link | None
@@ -119,6 +126,7 @@ class PaymentEntry(AccountsController):
 		purchase_taxes_and_charges_template: DF.Link | None
 		received_amount: DF.Currency
 		received_amount_after_tax: DF.Currency
+		reconcile_on_advance_payment_date: DF.Check
 		reference_date: DF.Date | None
 		reference_no: DF.Data | None
 		references: DF.Table[PaymentEntryReference]
@@ -195,6 +203,23 @@ class PaymentEntry(AccountsController):
 		self.make_advance_payment_ledger_entries()
 		self.update_advance_paid()  # advance_paid_status depends on the payment request amount
 		self.set_status()
+
+	def validate_for_repost(self):
+		validate_docs_for_voucher_types(["Payment Entry"])
+		validate_docs_for_deferred_accounting([self.name], [])
+
+	def on_update_after_submit(self):
+		# Flag will be set on Reconciliation
+		# Reconciliation tool will anyways repost ledger entries. So, no need to check and do implicit repost.
+		if self.flags.get("ignore_reposting_on_reconciliation"):
+			return
+
+		self.needs_repost = self.check_if_fields_updated(
+			fields_to_check=[], child_tables={"references": [], "taxes": [], "deductions": []}
+		)
+		if self.needs_repost:
+			self.validate_for_repost()
+			self.repost_accounting_entries()
 
 	def set_liability_account(self):
 		# Auto setting liability account should only be done during 'draft' status
@@ -478,7 +503,6 @@ class PaymentEntry(AccountsController):
 		if self.payment_type == "Internal Transfer":
 			for field in (
 				"party",
-				"party_balance",
 				"total_allocated_amount",
 				"base_total_allocated_amount",
 				"unallocated_amount",
@@ -506,25 +530,19 @@ class PaymentEntry(AccountsController):
 				)
 			else:
 				complete_contact_details(self)
-			if not self.party_balance:
-				self.party_balance = get_balance_on(
-					party_type=self.party_type, party=self.party, date=self.posting_date, company=self.company
-				)
 
 			if not self.party_account:
 				party_account = get_party_account(self.party_type, self.party, self.company)
 				self.set(self.party_account_field, party_account)
 				self.party_account = party_account
 
-		if self.paid_from and not self.paid_from_account_currency and not self.paid_from_account_balance:
+		if self.paid_from and not self.paid_from_account_currency:
 			acc = get_account_details(self.paid_from, self.posting_date, self.cost_center)
 			self.paid_from_account_currency = acc.account_currency
-			self.paid_from_account_balance = acc.account_balance
 
-		if self.paid_to and not self.paid_to_account_currency and not self.paid_to_account_balance:
+		if self.paid_to and not self.paid_to_account_currency:
 			acc = get_account_details(self.paid_to, self.posting_date, self.cost_center)
 			self.paid_to_account_currency = acc.account_currency
-			self.paid_to_account_balance = acc.account_balance
 
 		self.party_account_currency = (
 			self.paid_from_account_currency
@@ -635,7 +653,7 @@ class PaymentEntry(AccountsController):
 			if d.reference_doctype not in valid_reference_doctypes:
 				frappe.throw(
 					_("Reference Doctype must be one of {0}").format(
-						comma_or(_(d) for d in valid_reference_doctypes)
+						comma_or([_(d) for d in valid_reference_doctypes])
 					)
 				)
 
@@ -1500,16 +1518,26 @@ class PaymentEntry(AccountsController):
 			"voucher_detail_no": invoice.name,
 		}
 
-		if self.reconcile_on_advance_payment_date:
-			posting_date = self.posting_date
+		if invoice.reconcile_effect_on:
+			posting_date = invoice.reconcile_effect_on
 		else:
-			date_field = "posting_date"
-			if invoice.reference_doctype in ["Sales Order", "Purchase Order"]:
-				date_field = "transaction_date"
-			posting_date = frappe.db.get_value(invoice.reference_doctype, invoice.reference_name, date_field)
-
-			if getdate(posting_date) < getdate(self.posting_date):
+			# For backwards compatibility
+			# Supporting reposting on payment entries reconciled before select field introduction
+			if self.advance_reconciliation_takes_effect_on == "Advance Payment Date":
 				posting_date = self.posting_date
+			elif self.advance_reconciliation_takes_effect_on == "Oldest Of Invoice Or Advance":
+				date_field = "posting_date"
+				if invoice.reference_doctype in ["Sales Order", "Purchase Order"]:
+					date_field = "transaction_date"
+				posting_date = frappe.db.get_value(
+					invoice.reference_doctype, invoice.reference_name, date_field
+				)
+
+				if getdate(posting_date) < getdate(self.posting_date):
+					posting_date = self.posting_date
+			elif self.advance_reconciliation_takes_effect_on == "Reconciliation Date":
+				posting_date = nowdate()
+			frappe.db.set_value("Payment Entry Reference", invoice.name, "reconcile_effect_on", posting_date)
 
 		dr_or_cr, account = self.get_dr_and_account_for_advances(invoice)
 		args_dict["account"] = account
@@ -1664,6 +1692,14 @@ class PaymentEntry(AccountsController):
 			return self.paid_to
 		elif self.payment_type in ("Pay", "Internal Transfer"):
 			return self.paid_from
+
+	def get_value_in_transaction_currency(self, account_currency, gl_dict, field):
+		company_currency = erpnext.get_company_currency(self.company)
+		conversion_rate = self.target_exchange_rate
+		if self.paid_from_account_currency != company_currency:
+			conversion_rate = self.source_exchange_rate
+
+		return flt(gl_dict.get(field, 0) / (conversion_rate or 1))
 
 	def update_advance_paid(self):
 		if self.payment_type in ("Receive", "Pay") and self.party:
@@ -1882,7 +1918,7 @@ class PaymentEntry(AccountsController):
 		paid_amount -= sum(flt(d.amount, precision) for d in self.deductions)
 
 		for ref in self.references:
-			reference_outstanding_amount = ref.outstanding_amount
+			reference_outstanding_amount = flt(ref.outstanding_amount)
 			abs_outstanding_amount = abs(reference_outstanding_amount)
 
 			if reference_outstanding_amount > 0:
@@ -2327,10 +2363,17 @@ def get_outstanding_reference_documents(args, validate=False):
 	outstanding_invoices = []
 	negative_outstanding_invoices = []
 
+	party_account = args.get("party_account")
+
+	# get party account if advance account is set.
 	if args.get("book_advance_payments_in_separate_party_account"):
-		party_account = get_party_account(args.get("party_type"), args.get("party"), args.get("company"))
-	else:
-		party_account = args.get("party_account")
+		accounts = get_party_account(
+			args.get("party_type"), args.get("party"), args.get("company"), include_advance=True
+		)
+		advance_account = accounts[1] if len(accounts) >= 1 else None
+
+		if party_account == advance_account:
+			party_account = accounts[0]
 
 	if args.get("get_outstanding_invoices"):
 		outstanding_invoices = get_outstanding_invoices(
@@ -2668,9 +2711,7 @@ def get_party_details(company, party_type, party, date, cost_center=None):
 	account_balance = get_balance_on(party_account, date, cost_center=cost_center)
 	_party_name = "title" if party_type == "Shareholder" else party_type.lower() + "_name"
 	party_name = frappe.db.get_value(party_type, party, _party_name)
-	party_balance = get_balance_on(
-		party_type=party_type, party=party, company=company, cost_center=cost_center
-	)
+
 	if party_type in ["Customer", "Supplier"]:
 		party_bank_account = get_party_bank_account(party_type, party)
 		bank_account = get_default_company_bank_account(company, party_type, party)
@@ -2679,7 +2720,6 @@ def get_party_details(company, party_type, party, date, cost_center=None):
 		"party_account": party_account,
 		"party_name": party_name,
 		"party_account_currency": account_currency,
-		"party_balance": party_balance,
 		"account_balance": account_balance,
 		"party_bank_account": party_bank_account,
 		"bank_account": bank_account,
@@ -2910,6 +2950,7 @@ def get_payment_entry(
 	pe.paid_amount = paid_amount
 	pe.received_amount = received_amount
 	pe.letter_head = doc.get("letter_head")
+	pe.bank_account = frappe.db.get_value("Bank Account", {"is_company_account": 1, "is_default": 1}, "name")
 
 	if dt in ["Purchase Order", "Sales Order", "Sales Invoice", "Purchase Invoice"]:
 		pe.project = doc.get("project") or reduce(
@@ -2918,7 +2959,7 @@ def get_payment_entry(
 
 	if pe.party_type in ["Customer", "Supplier"]:
 		bank_account = get_party_bank_account(pe.party_type, pe.party)
-		pe.set("bank_account", bank_account)
+		pe.set("party_bank_account", bank_account)
 		pe.set_bank_account_data()
 
 	# only Purchase Invoice can be blocked individually
@@ -3396,13 +3437,14 @@ def add_income_discount_loss(pe, doc, total_discount_percent) -> float:
 	"""Add loss on income discount in base currency."""
 	precision = doc.precision("total")
 	base_loss_on_income = doc.get("base_total") * (total_discount_percent / 100)
+	positive_negative = -1 if pe.payment_type == "Pay" else 1
 
 	pe.append(
 		"deductions",
 		{
 			"account": frappe.get_cached_value("Company", pe.company, "default_discount_account"),
 			"cost_center": pe.cost_center or frappe.get_cached_value("Company", pe.company, "cost_center"),
-			"amount": flt(base_loss_on_income, precision),
+			"amount": flt(base_loss_on_income, precision) * positive_negative,
 		},
 	)
 
@@ -3414,6 +3456,7 @@ def add_tax_discount_loss(pe, doc, total_discount_percentage) -> float:
 	tax_discount_loss = {}
 	base_total_tax_loss = 0
 	precision = doc.precision("tax_amount_after_discount_amount", "taxes")
+	positive_negative = -1 if pe.payment_type == "Pay" else 1
 
 	# The same account head could be used more than once
 	for tax in doc.get("taxes", []):
@@ -3436,7 +3479,7 @@ def add_tax_discount_loss(pe, doc, total_discount_percentage) -> float:
 				"account": account,
 				"cost_center": pe.cost_center
 				or frappe.get_cached_value("Company", pe.company, "cost_center"),
-				"amount": flt(loss, precision),
+				"amount": flt(loss, precision) * positive_negative,
 			},
 		)
 
@@ -3502,19 +3545,6 @@ def get_paid_amount(dt, dn, party_type, party, account, due_date):
 	)
 
 	return paid_amount[0][0] if paid_amount else 0
-
-
-@frappe.whitelist()
-def get_party_and_account_balance(
-	company, date, paid_from=None, paid_to=None, ptype=None, pty=None, cost_center=None
-):
-	return frappe._dict(
-		{
-			"party_balance": get_balance_on(party_type=ptype, party=pty, cost_center=cost_center),
-			"paid_from_account_balance": get_balance_on(paid_from, date, cost_center=cost_center),
-			"paid_to_account_balance": get_balance_on(paid_to, date=date, cost_center=cost_center),
-		}
-	)
 
 
 @frappe.whitelist()
