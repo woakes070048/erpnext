@@ -8,6 +8,7 @@ from frappe.utils.file_manager import remove_file
 
 from erpnext.controllers.taxes_and_totals import ItemWiseTaxDetail, get_itemised_tax
 from erpnext.regional.italy import state_codes
+from erpnext.stock.utils import get_default_stock_uom
 
 
 def update_itemised_tax_data(doc):
@@ -159,7 +160,7 @@ def get_invoice_summary(items, taxes):
 						rate=reference_row.tax_amount,
 						qty=1.0,
 						amount=reference_row.tax_amount,
-						stock_uom=frappe.db.get_single_value("Stock Settings", "stock_uom") or "Nos",
+						stock_uom=get_default_stock_uom(),
 						tax_rate=tax.rate,
 						tax_amount=(reference_row.tax_amount * tax.rate) / 100,
 						net_amount=reference_row.tax_amount,
@@ -331,22 +332,19 @@ def sales_invoice_on_submit(doc, method):
 	]:
 		return
 
-	if not len(doc.payment_schedule):
-		frappe.throw(_("Please set the Payment Schedule"), title=_("E-Invoicing Information Missing"))
-	else:
-		for schedule in doc.payment_schedule:
-			if not schedule.mode_of_payment:
-				frappe.throw(
-					_("Row {0}: Please set the Mode of Payment in Payment Schedule").format(schedule.idx),
-					title=_("E-Invoicing Information Missing"),
-				)
-			elif not frappe.db.get_value("Mode of Payment", schedule.mode_of_payment, "mode_of_payment_code"):
-				frappe.throw(
-					_("Row {0}: Please set the correct code on Mode of Payment {1}").format(
-						schedule.idx, schedule.mode_of_payment
-					),
-					title=_("E-Invoicing Information Missing"),
-				)
+	for schedule in doc.payment_schedule:
+		if not schedule.mode_of_payment:
+			frappe.throw(
+				_("Row {0}: Please set the Mode of Payment in Payment Schedule").format(schedule.idx),
+				title=_("E-Invoicing Information Missing"),
+			)
+		elif not frappe.db.get_value("Mode of Payment", schedule.mode_of_payment, "mode_of_payment_code"):
+			frappe.throw(
+				_("Row {0}: Please set the correct code on Mode of Payment {1}").format(
+					schedule.idx, schedule.mode_of_payment
+				),
+				title=_("E-Invoicing Information Missing"),
+			)
 
 	prepare_and_attach_invoice(doc)
 

@@ -37,6 +37,7 @@ class StockSettings(Document):
 		auto_indent: DF.Check
 		auto_insert_price_list_rate_if_missing: DF.Check
 		auto_reserve_serial_and_batch: DF.Check
+		auto_reserve_stock: DF.Check
 		auto_reserve_stock_for_sales_order_on_purchase: DF.Check
 		clean_description_html: DF.Check
 		default_warehouse: DF.Link | None
@@ -55,6 +56,7 @@ class StockSettings(Document):
 		role_allowed_to_create_edit_back_dated_transactions: DF.Link | None
 		role_allowed_to_over_deliver_receive: DF.Link | None
 		sample_retention_warehouse: DF.Link | None
+		set_serial_and_batch_bundle_naming_based_on_naming_series: DF.Check
 		show_barcode_field: DF.Check
 		stock_auth_role: DF.Link | None
 		stock_frozen_upto: DF.Date | None
@@ -75,6 +77,7 @@ class StockSettings(Document):
 			"default_warehouse",
 			"set_qty_in_transactions_based_on_serial_no_input",
 			"use_serial_batch_fields",
+			"set_serial_and_batch_bundle_naming_based_on_naming_series",
 		]:
 			frappe.db.set_default(key, self.get(key, ""))
 
@@ -165,6 +168,9 @@ class StockSettings(Document):
 
 	def validate_stock_reservation(self):
 		"""Raises an exception if the user tries to enable/disable `Stock Reservation` with `Negative Stock` or `Open Stock Reservation Entries`."""
+
+		if not self.enable_stock_reservation and self.auto_reserve_stock:
+			self.auto_reserve_stock = 0
 
 		# Skip validation for tests
 		if frappe.flags.in_test:
